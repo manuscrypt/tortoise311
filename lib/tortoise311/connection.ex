@@ -45,7 +45,8 @@ defmodule Tortoise311.Connection do
                   | Tortoise311.Package.Subscribe.t()}
                | {:clean_session, boolean()}
                | {:enable_telemetry, boolean()}
-               | {:handler, {atom(), term()}},
+               | {:handler, {atom(), term()}}
+               | {:first_connect_delay, non_neg_integer()},
              options: [option]
   def start_link(connection_opts, opts \\ []) do
     client_id = Keyword.fetch!(connection_opts, :client_id)
@@ -76,7 +77,14 @@ defmodule Tortoise311.Connection do
       end
 
     # @todo, validate that the handler is valid
-    connection_opts = Keyword.take(connection_opts, [:client_id, :handler, :enable_telemetry])
+    connection_opts =
+      Keyword.take(connection_opts, [
+        :client_id,
+        :handler,
+        :enable_telemetry,
+        :first_connect_delay
+      ])
+
     initial = {server, connect, backoff, subscriptions, connection_opts}
     opts = Keyword.merge(opts, name: via_name(client_id))
     GenServer.start_link(__MODULE__, initial, opts)
@@ -381,9 +389,7 @@ defmodule Tortoise311.Connection do
     Tortoise311.Registry.put_meta(via_name(client_id), :connecting)
     {:ok, _pid} = Tortoise311.Events.register(client_id, :status)
 
-    # eventually, switch to handle_continue
-    send(self(), :connect)
-    {:ok, state}
+    {:ok, state, {:continue, :first_connect}}
   end
 
   @impl GenServer
@@ -391,6 +397,19 @@ defmodule Tortoise311.Connection do
     :ok = Tortoise311.Registry.delete_meta(via_name(state.connect.client_id))
     :ok = Events.dispatch(state.client_id, :status, :terminated)
     :ok
+  end
+
+  @impl GenServer
+  def handle_continue(:first_connect, state) do
+    # Apply a short delay before connecting to limit the max rate of reconnects
+    # if the GenServer crashes. The delay is jittered by 50% of its value. The
+    # default is 1 second.
+    delay = Keyword.get(state.opts, :first_connect_delay, 1000)
+    delay_with_jitter = round(delay * (1.0 + (:rand.uniform() - 0.5)))
+
+    Process.send_after(self(), :connect, delay_with_jitter)
+
+    {:noreply, state}
   end
 
   @impl GenServer
@@ -458,7 +477,7 @@ defmodule Tortoise311.Connection do
         # subscribe to the predefined topics
         case Inflight.track_sync(client_id, {:outgoing, subscriptions}, 5000) do
           {:error, :timeout} ->
-            {:stop, :subscription_timeout, state}
+            {:noreply, retry_subscribe(state, "Subscription timed out")}
 
           result ->
             case handle_suback_result(result, state) do
@@ -466,8 +485,8 @@ defmodule Tortoise311.Connection do
                 {:noreply, updated_state}
 
               {:error, reasons} ->
-                error = {:unable_to_subscribe, reasons}
-                {:stop, error, state}
+                {:noreply,
+                 retry_subscribe(state, "Subscription failed because of #{inspect(reasons)}")}
             end
         end
     end
@@ -673,6 +692,17 @@ defmodule Tortoise311.Connection do
     # set clean session to false for future reconnect attempts
     connect = %Connect{connect | clean_session: false}
     {:ok, %State{state | connect: connect}}
+  end
+
+  defp retry_subscribe(state, reason) do
+    {timeout, state} = Map.get_and_update(state, :backoff, &Backoff.next/1)
+
+    Logger.warning(
+      "[Tortoise311] #{reason}: #{inspect(summarize_state(state))}. Retrying in #{timeout} msecs."
+    )
+
+    Process.send_after(self(), :subscribe, timeout)
+    state
   end
 
   defp start_connection_supervisor(opts) do
